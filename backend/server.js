@@ -1,4 +1,4 @@
-// server.js - Advanced DS&A Platform with AI Features
+// At the top of server.js, update your imports
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const WebSocket = require('ws');
 const http = require('http');
+const { Pool } = require('pg'); // Add this
 
 const app = express();
 const server = http.createServer(app);
@@ -17,17 +18,231 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'duolingo-internship-2025';
 
-// Database
-const db = {
+// Database connection
+const DATABASE_URL = process.env.DATABASE_URL;
+const pool = DATABASE_URL ? new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+}) : null;
+
+// Initialize database tables
+async function initDatabase() {
+  if (!pool) {
+    console.log('No database connected - using in-memory storage');
+    return;
+  }
+  
+  try {
+    // Create users table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        email VARCHAR(255),
+        password VARCHAR(255) NOT NULL,
+        total_xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1,
+        streak INTEGER DEFAULT 0,
+        hearts INTEGER DEFAULT 5,
+        gems INTEGER DEFAULT 100,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    
+    // Create leaderboard table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS leaderboard (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) NOT NULL,
+        xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1,
+        accuracy INTEGER DEFAULT 0,
+        badges INTEGER DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    
+    // Create or update demo user
+    await pool.query(`
+      INSERT INTO users (username, email, password, total_xp, level, hearts, gems)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (username) DO NOTHING
+    `, ['demo', 'demo@test.com', await bcrypt.hash('demo123', 10), 0, 1, 5, 100]);
+    
+    // Add demo user to leaderboard
+    await pool.query(`
+      INSERT INTO leaderboard (username, xp, level)
+      VALUES ($1, $2, $3)
+      ON CONFLICT DO NOTHING
+    `, ['demo', 0, 1]);
+    
+    console.log('Database initialized successfully');
+  } catch (err) {
+    console.error('Database initialization error:', err);
+  }
+}
+
+// Initialize database on startup
+initDatabase();
+
+// In-memory fallback if no database
+const memoryDb = {
   users: new Map(),
-  leaderboard: [],
-  battles: new Map(),
-  achievements: new Map(),
-  userProgress: new Map(),
-  aiHints: new Map()
+  leaderboard: []
 };
 
-const wsClients = new Map();
+// Update your register endpoint to use database
+app.post('/api/auth/register', async (req, res) => {
+  const { username, email, password } = req.body;
+  
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
+  
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    if (pool) {
+      // Use database
+      const result = await pool.query(
+        'INSERT INTO users (username, email, password) VALUES ($1, $2, $3) RETURNING *',
+        [username, email, hashedPassword]
+      );
+      
+      const user = result.rows[0];
+      
+      // Add to leaderboard
+      await pool.query(
+        'INSERT INTO leaderboard (username, xp, level) VALUES ($1, $2, $3)',
+        [username, 0, 1]
+      );
+      
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET);
+      
+      res.json({
+        token,
+        user: {
+          username: user.username,
+          email: user.email,
+          totalXP: user.total_xp,
+          level: user.level,
+          streak: user.streak,
+          hearts: user.hearts,
+          gems: user.gems
+        }
+      });
+    } else {
+      // Fallback to memory
+      if (memoryDb.users.has(username)) {
+        return res.status(400).json({ error: 'Username exists' });
+      }
+      
+      const user = {
+        id: Date.now(),
+        username,
+        email,
+        password: hashedPassword,
+        totalXP: 0,
+        level: 1,
+        streak: 0,
+        hearts: 5,
+        gems: 100
+      };
+      
+      memoryDb.users.set(username, user);
+      memoryDb.leaderboard.push({ username, xp: 0, level: 1 });
+      
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET);
+      res.json({ token, user });
+    }
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Update login to use database
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    let user;
+    
+    if (pool) {
+      // Use database
+      const result = await pool.query(
+        'SELECT * FROM users WHERE username = $1',
+        [username]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      user = result.rows[0];
+      const valid = await bcrypt.compare(password, user.password);
+      
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET);
+      
+      res.json({
+        token,
+        user: {
+          username: user.username,
+          email: user.email,
+          totalXP: user.total_xp,
+          level: user.level,
+          streak: user.streak,
+          hearts: user.hearts,
+          gems: user.gems
+        }
+      });
+    } else {
+      // Fallback to memory
+      user = memoryDb.users.get(username);
+      
+      if (!user) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const valid = await bcrypt.compare(password, user.password);
+      
+      if (!valid) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+      
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET);
+      res.json({ token, user });
+    }
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Update leaderboard to use database
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    if (pool) {
+      const result = await pool.query(
+        'SELECT * FROM leaderboard ORDER BY xp DESC LIMIT 20'
+      );
+      res.json({ leaderboard: result.rows, total: result.rows.length });
+    } else {
+      // Fallback to memory
+      const sorted = [...memoryDb.leaderboard].sort((a, b) => b.xp - a.xp);
+      res.json({ leaderboard: sorted.slice(0, 20), total: sorted.length });
+    }
+  } catch (err) {
+    console.error('Leaderboard error:', err);
+    res.status(500).json({ error: 'Failed to fetch leaderboard' });
+  }
+});
 
 // ============ MASSIVE QUESTION BANK (200+ Questions) ============
 const questionBank = {
